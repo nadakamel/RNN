@@ -1,4 +1,5 @@
 import os, warnings, shutil, glob, random, csv, time, keras
+import pandas as pd
 import numpy as np
 from numpy import newaxis
 import matplotlib.pyplot as plt
@@ -23,40 +24,66 @@ def get_session(gpu_fraction=0.3):
 
 KTF.set_session(get_session())
 
-FILE_PATH = './sp500-10yrs.csv'
-BATCH_SIZE = 512
-EPOCHS = 10
-RMSprop = optimizers.RMSprop(lr=0.001, rho=0.9, epsilon=1e-08, decay=0.0)
-OPTIMIZER = RMSprop
-
-MODEL_RESULT = None
-SEQUENCE_LENGTH = 50
-LAYERS = [1, 50, 128, 1]
-NORMALIZE_WINDOW = True
-
 # Hide messy TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 #Hide messy Numpy warnings
 warnings.filterwarnings("ignore")
 
-# Load data
-def load_data(filename, seq_len, normalise_window):
-    f = open(filename, 'rb').read()
-    data = f.split('\n')
-    data = [float(num) for num in data]
+FILE_PATH = './sp500-10Years.csv'
+BATCH_SIZE = 512
+EPOCHS = 50
+RMSprop = optimizers.RMSprop(lr=0.001, rho=0.9, epsilon=1e-08, decay=0.0)
+OPTIMIZER = RMSprop
 
-    sequence_length = seq_len + 1
+SEQUENCE_LENGTH = 25
+LAYERS = [1, 50, 128, 1]
+NORMALIZE_WINDOW = True
+
+MODEL_RESULT = None
+
+# Convert a tuple or struct_time representing a time as returned by gmtime() or localtime() in a date and time format
+CURRENT_TIME = time.strftime("%c")
+
+# Generating graphs from the TensorFlow processing at different paths for each run (based on time of run)
+tensorboard_callback = TensorBoard(log_dir='./logs/' + CURRENT_TIME, histogram_freq = 0, write_graph = True, write_images = False)
+
+# saving the best weights found at current run of the network model, saved to binary file assigned to filepath
+checkpointer = ModelCheckpoint(filepath = "./weights.hdf5", verbose = 1, save_best_only = True, monitor = 'val_loss')    # Reference: https://keras.io/callbacks/#modelcheckpoint
+
+# decaying learning rate when a plateau is reached in the validation loss by a factor of 0.2; reference: https://keras.io/callbacks/#reducelronplateau
+reduce_lr = ReduceLROnPlateau(monitor = 'loss', factor = 0.2, patience = 5, min_lr = 1e-6)
+
+# stop training when a monitored quantity in the validation loss has stopped improving.
+early_stopping = EarlyStopping(monitor='loss', min_delta=0.0001, patience=5, verbose=1, mode='min')
+
+CALLBACKS = [tensorboard_callback,checkpointer,reduce_lr,early_stopping]
+
+folder_path = './' + str(CURRENT_TIME) + '/'
+DIRECTORY = os.path.dirname(folder_path)
+
+def check_folder_existence():
+    global DIRECTORY
+    if not os.path.exists(DIRECTORY):
+        os.makedirs(DIRECTORY)
+
+def load_data(filename, sequence_length, normalise_window):
+    data = pd.read_csv(filename, usecols=[1], engine='python', skipfooter=3, header=1)
+    data = data.values
+    data = data.astype('float32')
+
+    sequence_length = sequence_length + 1
     result = []
     for index in range(len(data) - sequence_length):
         result.append(data[index: index + sequence_length])
 
     if normalise_window:
         result = normalise_windows(result)
-
+    
     result = np.array(result)
+
     row = round(0.9 * result.shape[0])
     train = result[:int(row), :]
-    #random.shuffle(train)
+    random.shuffle(train)
 
     '''
     x_train: training sequence
@@ -86,7 +113,7 @@ def build_model(layers):
     model = Sequential()
 
     model.add(LSTM(
-        input_shape=(layers[1], layers[0]),
+        input_dim=layers[0],
         output_dim=layers[1],
         return_sequences=True))
     model.add(Dropout(0.2))
@@ -101,54 +128,27 @@ def build_model(layers):
     model.add(Activation('linear'))
 
     start = time.time()
-    model.compile(loss="mse", optimizer=OPTIMIZER, metrics=['accuracy'])
+    model.compile(loss='mse', optimizer=OPTIMIZER)
     print 'Compilation Time (in secs): ' + str(time.time() - start)
+    
     return model
 
-def predict_point_by_point(model, data):
-    #Predict each timestep given the last sequence of true data, in effect only predicting 1 step ahead each time
-    predicted = model.predict(data)
-    predicted = np.reshape(predicted, (predicted.size,))
-    return predicted
+def compile_model(model, x_train, y_train, x_test, y_test):
+    result = model.fit(
+	    x_train,
+	    y_train,
+	    batch_size=BATCH_SIZE,
+	    nb_epoch=EPOCHS,
+	    validation_split=0.05,
+        validation_data=(x_test, y_test),
+        callbacks=CALLBACKS)
+    
+    return result
 
-def predict_sequence_full(model, data, window_size):
-    #Shift the window by 1 new prediction each time, re-run predictions on new window
-    curr_frame = data[0]
-    predicted = []
-    for i in range(len(data)):
-        predicted.append(model.predict(curr_frame[newaxis,:,:])[0,0])
-        curr_frame = curr_frame[1:]
-        curr_frame = np.insert(curr_frame, [window_size-1], predicted[-1], axis=0)
-    return predicted
-
-def predict_sequences_multiple(model, data, window_size, prediction_len):
-    #Predict sequence of 50 steps before shifting prediction run forward by 50 steps
-    prediction_seqs = []
-    for i in range(int(len(data)/prediction_len)):
-        curr_frame = data[i*prediction_len]
-        predicted = []
-        for j in range(prediction_len):
-            predicted.append(model.predict(curr_frame[newaxis,:,:])[0,0])
-            curr_frame = curr_frame[1:]
-            curr_frame = np.insert(curr_frame, [window_size-1], predicted[-1], axis=0)
-        prediction_seqs.append(predicted)
-    return prediction_seqs
-
-
-def plot_results_multiple(predicted_data, true_data, prediction_len):
-    fig = plt.figure(facecolor='white')
-    ax = fig.add_subplot(111)
-    ax.plot(true_data, label='True Data')
-    plt.title('Stock Market Multiple Sequential Predictions')
-    plt.xlabel('Days')
-    plt.ylabel('Prices')
-    #Pad the list of predictions to shift it in the graph to it's correct start
-    dates = ['27th of Nov', '28th of Nov', '29th of Nov', '30th of Nov', '1st of Dec']
-    for i, data in enumerate(predicted_data):
-        padding = [None for p in range(i * prediction_len)]
-        plt.plot(padding + data, label=dates[i]+' Prediction')
-        plt.legend(loc='bottom left')
-    plt.show()
+def evaluate_model(model, x_test, y_test):
+    # evaluate the result
+    test_mse = model.evaluate(x_test, y_test, verbose=1)
+    print ('\nThe mean squared error (MSE) on the test data set is %.3f over %d test samples.') %(test_mse, len(y_test))
 
 def plot_loss_vs_epochs():
     global MODEL_RESULT
@@ -157,34 +157,80 @@ def plot_loss_vs_epochs():
     plt.ylabel('Loss')
     plt.xlabel('Epoch')
     plt.legend(['train'], loc='upper right')
-    plt.show()
+    check_folder_existence()
+    plt.savefig('./'+DIRECTORY+'/loss_vs_epochs.jpg')
+
+def plot_test_actual_vs_predicted(predictions, test_out):
+    fig = plt.figure()
+    plt.plot(test_out)
+    plt.plot(predictions)
+    plt.title('SP500 | Last '+str(len(predictions))+' days in test')
+    plt.xlabel('Days')
+    plt.ylabel('Stock Closing Prices')
+    plt.legend(['actual', 'prediction'], loc='upper right')
+    check_folder_existence()
+    plt.savefig('./'+DIRECTORY+'/output_prediction.jpg', bbox_inches='tight')
+
+def predict_next_sequence(model, last_sequence, prediction_length):
+    prediction_seqs = []
+    for i in range(prediction_length):
+        normalised_data = [((float(p) / float(last_sequence[0])) - 1) for p in last_sequence[-SEQUENCE_LENGTH:]]
+        normalised_data = np.array(normalised_data)
+        normalised_data = np.reshape(normalised_data, (normalised_data.shape[0], 1))
+        normalised_data = np.array([normalised_data])
+        pred_value= (model.predict(normalised_data)[0][0] + 1) * last_sequence[0]
+        last_sequence.append(pred_value)
+        prediction_seqs.append(pred_value)
+
+    return prediction_seqs
 
 def main():
     print('> Loading data... ')
     train_seq, train_out, test_seq, test_out = load_data(FILE_PATH, SEQUENCE_LENGTH, NORMALIZE_WINDOW)
-
     print('> Data Loaded. Compiling...')
+    
     global_start_time = time.time()
     model = build_model(LAYERS)
     
     global MODEL_RESULT
-    MODEL_RESULT = model.fit(
-	    train_seq,
-	    train_out,
-	    batch_size=BATCH_SIZE,
-	    nb_epoch=EPOCHS,
-	    validation_split=0.05)
-
-    predictions = predict_sequences_multiple(model, test_seq, SEQUENCE_LENGTH, 50)
-	#predicted = predict_sequence_full(model, test_seq, seq_len)
-	#predicted = predict_point_by_point(model, test_seq)
-
-    print predictions
+    MODEL_RESULT = compile_model(model, train_seq, train_out, test_seq, test_out)
 
     print 'Training Duration (in secs): ' + str(time.time() - global_start_time)
-    plot_results_multiple(predictions, test_out, 50)
+    
+    # save model
+    model.save('./RNN.h5')
 
+    # plot training loss vs epochs
     plot_loss_vs_epochs()
+
+    # evaluate model
+    evaluate_model(model, test_seq, test_out)
+
+    # actual values in test vs predicted values
+    predictions = model.predict(test_seq)
+    num_test_samples = len(predictions)
+    predictions = np.reshape(predictions, (num_test_samples,1))
+
+    # plot results
+    plot_test_actual_vs_predicted(predictions, test_out)
+    
+    # predicte coming days
+    data = pd.read_csv(FILE_PATH, usecols=[1], engine='python', skipfooter=3, header=1)
+    data = data.values
+    data = data.astype('float32')
+    num_of_last_days = 15
+    data = data[-num_of_last_days:].tolist()
+    for i in range(len(data)):
+        data[i] = data[i][0]
+    lastDays = data
+    prediction_length = 5
+    predicted_values = predict_next_sequence(model, lastDays, prediction_length)
+
+    # print predictions
+    print 'Predicted values for next '+str(prediction_length)+' days..'
+    for i in range(len(predicted_values)):
+        print(i+1, predicted_values[i])
+
 
 if __name__ == "__main__":
     main()
